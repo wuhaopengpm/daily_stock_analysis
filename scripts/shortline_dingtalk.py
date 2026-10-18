@@ -569,6 +569,22 @@ def main():
         if delta.days < 0 or delta.days > 30:
             raise SystemExit("手动补跑仅允许最近30日内且不晚于今天的日期")
         today = target.strftime("%Y%m%d")
+    elif os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        # GitHub 手动 review 适用于非交易日的联调；默认工作日定时任务不补跑。
+        import akshare as ak
+        import pandas as pd
+        calendar = ak.tool_trade_date_hist_sina()
+        if calendar is None or calendar.empty or "trade_date" not in calendar:
+            raise RuntimeError("手动补跑无法验证交易日历，不生成历史报告")
+        dates = pd.to_datetime(calendar["trade_date"]).dt.strftime("%Y%m%d")
+        prior_days = [d for d in dates if d <= today]
+        if not prior_days:
+            raise RuntimeError("交易日历没有可用的历史交易日")
+        manual_day = max(prior_days)
+        if manual_day != today:
+            today, historical = manual_day, True
+            if (local_now().date() - datetime.strptime(today, "%Y%m%d").date()).days > 7:
+                raise RuntimeError("最近交易日超过7天，不自动历史补跑")
     snapshot = fetch_market_snapshot(today)
     if snapshot is None:
         print(f"{today}不是A股交易日，不发送复盘。")
