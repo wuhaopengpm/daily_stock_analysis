@@ -283,13 +283,16 @@ def validate_plan(plan, snapshot):
         clean["overnight_candidates"] = []
     temp = plan.get("temperature")
     temp = max(0, min(100, int(number(temp)))) if temp is not None else None
+    predictions = plan.get("predictions", [])
+    if not isinstance(predictions, list):
+        predictions = []
     return {
         "temperature": temp, "phase": str(plan.get("phase", "待核实"))[:30],
         "summary": str(plan.get("summary", ""))[:1200],
         "retrospection": str(plan.get("retrospection", ""))[:1900],
         "overnight": decision,
         **clean,
-        "predictions": [str(x)[:260] for x in plan.get("predictions", [])[:5]
+        "predictions": [str(x)[:260] for x in predictions[:5]
                         if isinstance(x, str)],
     }
 
@@ -388,8 +391,12 @@ def send_dingtalk(text):
             "title": f"股票短线复盘（{i}/{len(chunks)}）",
             "text": f"### 【股票】短线复盘（{i}/{len(chunks)}）\n\n" + body,
         }}
-        res = requests.post(url, json=msg, timeout=20)
-        res.raise_for_status()
+        try:
+            res = requests.post(url, json=msg, timeout=20)
+            res.raise_for_status()
+        except requests.RequestException as exc:
+            # SDK/requests errors may include the signed webhook URL with its secret token.
+            raise RuntimeError(f"钉钉推送网络或HTTP失败：{type(exc).__name__}（请求URL已隐藏）") from None
         result = res.json()
         if result.get("errcode", -1) != 0:
             raise RuntimeError(f"钉钉拒收消息，errcode={result.get('errcode')}，errmsg={str(result.get('errmsg'))[:120]}")
