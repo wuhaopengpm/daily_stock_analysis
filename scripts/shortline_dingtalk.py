@@ -325,7 +325,8 @@ def local_rule_plan(snapshot, prior, outcomes):
         f"涨停{limit_up}、炸板率{broken_rate if broken_rate is not None else '未知'}%、"
         f"昨日涨停股当日平均涨跌{premium_label}。"
         f"策略：{style}；参考总仓位上限{max_position}%（非买入指令），"
-        "单一观察标的试错仓上限5%，遵守单日亏损停止交易及A股T+1约束。"
+        f"单一观察标的参考仓位上限{min(5, max_position)}%，"
+        "遵守单日亏损停止交易及A股T+1约束。"
         "没有实时竞价、监管公告及隔夜排队条件核验，今晚默认不排。"
     )
     predictions = [
