@@ -1,0 +1,34 @@
+# A 股短线复盘 → 钉钉推送（独立工作流）
+
+> 此工作流只生成研究报告并向指定钉钉群发送 Markdown，不连接券商、不挂单、不撤单。保留原有 18:00 的 00-daily-analysis.yml，互不覆盖。
+
+## 当前能力和边界
+
+- 北京时间周一至周五约 **17:17**：GitHub Actions 尝试运行，非 A 股交易日跳过；GitHub 排队可能延迟甚至跳过。
+- 用 AKShare 的东方财富涨停池、炸板池、昨日涨停股池，计算 1 进 2、2 进 3、3 进 4、4 进 5 的**样本晋级比例**、炸板比例等。这些统计口径不代表个人打板胜率。
+- 使用**独立** OpenAI API 密钥（可不配置；不配置只输出统计且“今晚不排”），生成研究候选、观察/回避名单及次日可验证判断。ChatGPT Plus 订阅**不包含** API 调用费用。
+- 钉钉通过群自定义机器人 Webhook 推送；支持机器人“加签”密钥及消息分段，必须确认钉钉业务响应 errcode=0。
+- 每次成功推送后，把当日策略缓存为下一交易日验收基线，并保留报告 Artifact 30 天。GitHub 缓存可能过期或丢失，若拿不到基线，报告会明确说明。
+- 只支持**日线级**次日验证；没有 9:15–9:20 实时竞价、逐笔排队/可成交率、真实证券委托状态、完整公告和题材证据。这些条件无法核实时不能将报告等同于可执行交易指令。**不要依据此工作流安排自动撤单。**
+
+## 配置顺序
+
+1. 在专用开发分支审查脚本、工作流、单元测试；运行 python -m unittest discover -s tests -p 'test_shortline_dingtalk.py'。按仓库 PR 审核流程审核通过后，**由用户确认才合并 main**。
+2. GitHub 仓库 **Settings → Secrets and variables → Actions → Secrets** 创建：
+   - DINGTALK_WEBHOOK（必需）：官方 https://oapi.dingtalk.com/robot/send?access_token=... 。视为密钥，不能发在聊天里或放代码仓库。
+   - DINGTALK_SECRET（加签模式才需要）：自定义机器人安全设置的 SEC...。
+   - SHORTLINE_OPENAI_API_KEY（需要 AI 解读时）：API 平台的密钥，**不是** ChatGPT 登录凭证。
+3. **Variables** 可选配置：
+   - SHORTLINE_OPENAI_MODEL（默认 gpt-4.1-mini，需实际确认 API 账号能访问）。
+   - SHORTLINE_OPENAI_BASE_URL（默认 OpenAI 官方；仅对信任的兼容 API 使用）。
+4. 合并后，打开 **Actions → A股短线复盘钉钉推送 → Run workflow**，先选择 test；收到“【股票】GitHub Actions→钉钉通道测试成功”再选择 review 验证收盘流程。工作流列表不显示时，不要在网页手工创建同名 workflow；先检查 Fork 仓库的 Actions 状态及默认分支工作流识别情况。
+5. review 依赖实时可访问的第三方行情接口，**接口异常时应失败而非编造当天行情**。在 17:17 正式开始定时运行前，确认 API 调用、机器人安全验证、市场数据可靠性和样本报告均达标。
+
+## 安全和测试
+
+- 所有密钥必须放仓库 Actions Secrets；不要把 webhook URL、API Key 发在对话、PR 描述、日志或仓库里。
+- 如果钉钉机器人开启 **IP 白名单**，GitHub Hosted Runner 的 IP 不固定，可能无法投递；优先选择“加签”方式（仍须满足企业安全策略）。
+- 机器人如果额外设定关键词，需要使实际消息正文包含关键词；默认消息中包含“股票”。
+- 测试模式只发送测试消息，不抓行情、不调用模型。
+- 不允许未经确认修改或合并 main；回滚方式是在主分支禁用或撤回这个独立的 workflow，而不是修改原有大盘任务。
+- 程序仅支持人工审核后的策略研究，不能保证板上成交，也不能替代券商竞价监控。

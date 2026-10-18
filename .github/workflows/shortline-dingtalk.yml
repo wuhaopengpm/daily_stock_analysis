@@ -1,0 +1,92 @@
+name: A股短线复盘钉钉推送
+
+on:
+  schedule:
+    # GitHub按UTC解析cron；北京时间17:17，避开整点高峰。定时可能延误。
+    - cron: '17 9 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'test仅发送通道测试；review读取真实交易日行情并推送复盘'
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-share-shortline-dingtalk
+  cancel-in-progress: false
+
+jobs:
+  shortline:
+    name: Shortline review and DingTalk
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TZ: Asia/Shanghai
+      # 与原有18:00常规股票分析互不影响，也不使用其通知配置。
+      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+      OPENAI_API_KEY: ${{ secrets.SHORTLINE_OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ vars.SHORTLINE_OPENAI_BASE_URL }}
+      OPENAI_MODEL: ${{ vars.SHORTLINE_OPENAI_MODEL || 'gpt-4.1-mini' }}
+      MODE: ${{ github.event_name == 'schedule' && 'review' || inputs.mode }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install shortline dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pandas akshare openai
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p 'test_shortline_dingtalk.py'
+
+      - name: Restore previous review state
+        if: env.MODE == 'review'
+        uses: actions/cache/restore@v4
+        with:
+          path: .shortline_state
+          key: shortline-state-${{ github.run_id }}
+          restore-keys: |
+            shortline-state-
+
+      - name: Check DingTalk configuration
+        run: |
+          if [ -z "$DINGTALK_WEBHOOK" ]; then
+            echo "::error::请先在Settings/Secrets and variables/Actions配置DINGTALK_WEBHOOK"
+            exit 1
+          fi
+
+      - name: Run shortline pipeline
+        run: python scripts/shortline_dingtalk.py --mode "$MODE"
+
+      - name: Save previous review state
+        if: success() && env.MODE == 'review'
+        uses: actions/cache/save@v4
+        with:
+          path: .shortline_state
+          key: shortline-state-${{ github.run_id }}
+
+      - name: Store generated report and evidence
+        if: always() && env.MODE == 'review'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shortline-review-${{ github.run_number }}
+          path: |
+            reports/shortline/
+            .shortline_state/
+          if-no-files-found: ignore
+          retention-days: 30
