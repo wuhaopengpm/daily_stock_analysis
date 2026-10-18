@@ -17,6 +17,12 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+# 支持既作为包导入单测，也支持 python scripts/shortline_dingtalk.py 直接执行。
+try:
+    from scripts.shortline_ladder import high_board_risk, screen_full_ladder, ladder_report
+except ModuleNotFoundError:
+    from shortline_ladder import high_board_risk, screen_full_ladder, ladder_report
+
 TZ = ZoneInfo("Asia/Shanghai")
 STATE_FILE = Path(".shortline_state/state.json")
 OUT_DIR = Path("reports/shortline")
@@ -261,7 +267,6 @@ SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数�
 
 def local_rule_plan(snapshot, prior, outcomes):
     """离线可复现的日线情绪规则，不调用LLM；不产生自动隔夜挂单指令。"""
-    from scripts.shortline_ladder import high_board_risk, screen_full_ladder
     stats = snapshot.get("statistics", {})
     elevated_risk = high_board_risk(stats)
     limit_up = max(0, int(number(stats.get("limit_up"), 0)))
@@ -448,8 +453,7 @@ def render(snapshot, prior, outcomes, plan):
         f"涨停 {s['limit_up']} 家｜炸板 {s['broken']} 家｜炸板率 {s['broken_rate_percent']}%",
         f"昨日涨停股当日平均涨跌：{s['previous_limit_up_avg_change_percent']}%（接口可用时）",
     ]
-    for name, item in s["promotions"].items():
-        lines.append(f"{name}：{item['count']}/{item['base']}（{item['rate'] if item['rate'] is not None else '无样本'}%）")
+    lines.extend(ladder_report(snapshot, plan))
     lines += ["", "### 昨日策略验收", f"基线：{prior['origin']}",
               plan.get("retrospection") or "无可验证的前日策略记录。"]
     if outcomes:
