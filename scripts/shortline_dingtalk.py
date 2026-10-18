@@ -226,7 +226,7 @@ SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数�
 
 def local_rule_plan(snapshot, prior, outcomes):
     """离线可复现的日线情绪规则，不调用LLM；不产生自动隔夜挂单指令。"""
-    stats = snapshot["statistics"]
+    stats = snapshot.get("statistics", {})
     limit_up = max(0, int(number(stats.get("limit_up"), 0)))
     broken_rate = stats.get("broken_rate_percent")
     premium = stats.get("previous_limit_up_avg_change_percent")
