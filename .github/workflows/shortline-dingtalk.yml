@@ -55,7 +55,7 @@ jobs:
           fi
 
       - name: Unit tests
-        run: python -m unittest discover -s tests -p 'test_shortline_dingtalk.py'
+        run: python -m unittest discover -s tests -p 'test_shortline*.py'
 
       - name: Restore previous review state
         if: env.MODE == 'review'
