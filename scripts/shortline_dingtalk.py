@@ -211,7 +211,7 @@ def stock_outcomes(snapshot, prior):
     return results
 
 
-SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数字输出结构化、可证伪的决策；不能杜撰竞价数据、公告、热点题材、机构资金、成交概率、封单变化或盘中精确封板过程。行业分布不是主线题材证据。所有事实明确标明日期和数据来源，不知道写未知。不得把涨停即视为能排到；成交可能恰恰意味着开板风险。考虑A股T+1。禁止保证次日收益。昨日没有明确推荐过的票不能事后算推荐。必须核对前次方案对错，并给出下一次验证条件。只能在输入的当日涨停股池中选出今晚隔夜候选，最多两只；市场差时可以零只。不得凭名称臆测概念关联。
+SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数字输出结构化、可证伪的决策；不能杜撰竞价数据、公告、热点题材、机构资金、成交概率、封单变化或盘中精确封板过程。行业分布不是主线题材证据。所有事实明确标明日期和数据来源，不知道写未知。不得把涨停即视为能排到；成交可能恰恰意味着开板风险。考虑A股T+1。禁止保证次日收益。昨日没有明确推荐过的票不能事后算推荐。必须核对前次方案对错，并给出下一次验证条件。只有隔夜排板候选必须来自当日收盘涨停池（最多两只，市场差时零只）；竞价观察和明确放弃的股票可来自当日收盘涨停池、前一交易日涨停池或当日炸板池；当日没有收盘涨停的票绝不可标注为连板晋级。不得凭名称臆测概念关联。
 仅返回合法JSON对象，字段严格如下：
 {"temperature":整数0到100,"phase":"短文字","summary":"一段短文字",
 "retrospection":"昨日观点→本日可核实结果→判断偏差和改进；缺失的数据也须说清",
@@ -219,7 +219,7 @@ SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数�
 "watchlist":[{"code":"6位股票代码","reason":"为什么只观察竞价或等回封"}],
 "avoid":[{"code":"6位股票代码","reason":"避免的风险"}],
 "predictions":["下一交易日可证伪的判断，3至5条"]}
-所有候选必须来自今日涨停池，绝不能写不存在的代码。缺少必需信息时输出不排。
+所有名单都必须来自输入的股票池，绝不能写不存在的代码；隔夜排板候选只能从今日收盘涨停池挑选。没有确认的题材联动、公告或交易可行性，不应给出确定性隔夜排板结论；缺少必需信息时输出不排。
 """
 
 
@@ -256,13 +256,18 @@ def validate_plan(plan, snapshot):
     """不允许模型推荐非当日涨停池证券；不完整则不推隔夜候选。"""
     if not isinstance(plan, dict):
         raise ValueError("模型报告不是JSON对象")
-    allowed = {code_of(r): r for r in snapshot["limit_up_stocks"]}
+    allowed_overnight = {code_of(r): r for r in snapshot["limit_up_stocks"]}
+    allowed_watch = {}
+    for pool_name in ("yesterday_limit_up_stocks", "broken_stocks", "limit_up_stocks"):
+        for r in snapshot.get(pool_name, []):
+            allowed_watch[code_of(r)] = r
     clean = {}
     for key in ("overnight_candidates", "watchlist", "avoid"):
         valid = []
         candidates = plan.get(key, [])
         if not isinstance(candidates, list):
             candidates = []
+        allowed = allowed_overnight if key == "overnight_candidates" else allowed_watch
         for item in candidates:
             if not isinstance(item, dict):
                 continue
@@ -273,6 +278,9 @@ def validate_plan(plan, snapshot):
                               "reason": str(item.get("reason", ""))[:400]})
         clean[key] = valid[:2 if key == "overnight_candidates" else 4]
     decision = "排" if plan.get("overnight") == "排" and clean["overnight_candidates"] else "不排"
+    # 模型的“不排”判断必须与实际候选保持一致，避免自相矛盾的报告。
+    if decision == "不排":
+        clean["overnight_candidates"] = []
     temp = plan.get("temperature")
     temp = max(0, min(100, int(number(temp)))) if temp is not None else None
     return {
