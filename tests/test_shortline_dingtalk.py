@@ -60,6 +60,13 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(result["overnight_candidates"], [])
         self.assertEqual(result["temperature"], 0)
 
+    def test_malformed_model_predictions_type(self):
+        result = mod.validate_plan({
+            "overnight": "不排",
+            "predictions": "这个应当是数组而不是字符串",
+        }, snapshot())
+        self.assertEqual(result["predictions"], [])
+
     def test_invalid_codes_never_pass(self):
         result = mod.validate_plan({
             "overnight": "排",
@@ -111,6 +118,17 @@ class NotificationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "310000"):
                 mod.send_dingtalk("没有关键词")
     
+    def test_http_failure_does_not_expose_secret_url(self):
+        secret_url = "https://oapi.dingtalk.com/robot/send?access_token=SENSITIVE-SECRET"
+        with mock.patch.dict("os.environ", {
+            "DINGTALK_WEBHOOK": secret_url, "DINGTALK_SECRET": "",
+        }), mock.patch.object(mod.requests, "post", side_effect=
+                             mod.requests.ConnectionError(secret_url)):
+            with self.assertRaises(RuntimeError) as context:
+                mod.send_dingtalk("股票复盘")
+        self.assertNotIn("SENSITIVE-SECRET", str(context.exception))
+        self.assertIn("URL已隐藏", str(context.exception))
+
     def test_dingtalk_success(self):
         response = mock.Mock()
         response.json.return_value = {"errcode": 0, "errmsg": "ok"}
