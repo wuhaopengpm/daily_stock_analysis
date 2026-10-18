@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 import time
 from datetime import datetime, timedelta
-from urllib.parse import quote, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
 
 import requests
@@ -340,20 +340,21 @@ def signed_url(url, secret):
         return url
     ts = str(int(time.time() * 1000))
     raw = f"{ts}\n{secret}".encode("utf-8")
-    sig = quote(base64.b64encode(hmac.new(secret.encode("utf-8"), raw,
-                                           hashlib.sha256).digest()).decode("utf-8"), safe="")
+    sig = base64.b64encode(hmac.new(secret.encode("utf-8"), raw,
+                                         hashlib.sha256).digest()).decode("utf-8")
     parts = urlsplit(url)
     pairs = parse_qsl(parts.query, keep_blank_values=True)
     pairs.extend([("timestamp", ts), ("sign", sig)])
-    # sig已经quote转义；编码后重新处理一次是正常的URL编码，服务端解码后仍为签名。
+    # urlencode只执行一次百分号编码；避免钉钉校验出现sign not match。
     return urlunsplit((parts.scheme, parts.netloc, parts.path,
                        urlencode(pairs), parts.fragment))
 
 
 def send_dingtalk(text):
     webhook = os.getenv("DINGTALK_WEBHOOK", "").strip()
-    if not webhook.startswith("https://"):
-        raise RuntimeError("缺少HTTPS DINGTALK_WEBHOOK Secret")
+    host = urlsplit(webhook).hostname or ""
+    if not webhook.startswith("https://") or host not in ("oapi.dingtalk.com", "api.dingtalk.com"):
+        raise RuntimeError("请配置钉钉官方HTTPS Webhook到GitHub Secret：DINGTALK_WEBHOOK")
     secret = os.getenv("DINGTALK_SECRET", "").strip()
     # 控制单条钉钉payload，长报告按正文行尽力分段。
     limit = 13500
