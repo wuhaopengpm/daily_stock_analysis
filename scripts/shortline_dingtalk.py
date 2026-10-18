@@ -17,6 +17,12 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+# 支持既作为包导入单测，也支持 python scripts/shortline_dingtalk.py 直接执行。
+try:
+    from scripts.shortline_ladder import high_board_risk, screen_full_ladder, ladder_report
+except ModuleNotFoundError:
+    from shortline_ladder import high_board_risk, screen_full_ladder, ladder_report
+
 TZ = ZoneInfo("Asia/Shanghai")
 STATE_FILE = Path(".shortline_state/state.json")
 OUT_DIR = Path("reports/shortline")
@@ -100,14 +106,29 @@ def fetch_market_snapshot(ymd):
         if not {"代码", "名称", "连板数"}.issubset(set(df.columns)):
             raise RuntimeError(f"{name}缺少必要列，停止分析：{list(df.columns)}")
     # 仅对当日涨停股计算晋级；复牌一字板的成交可行性需单独核验。
-    today = rows(zt_today_df)
-    yesterday = rows(zt_yesterday_df)
-    broken = rows(broken_df)
-    yesterday_perf = rows(previous_performance_df)
+    # 不截断涨停/昨日涨停全梯队，避免高板数量与晋级分母发生系统性遗漏。
+    today = rows(zt_today_df, max_rows=len(zt_today_df))
+    yesterday = rows(zt_yesterday_df, max_rows=len(zt_yesterday_df))
+    broken = rows(broken_df, max_rows=len(broken_df))
+    yesterday_perf = rows(previous_performance_df, max_rows=len(previous_performance_df))
     today_by_code = {code_of(r): r for r in today}
     prev_by_code = {code_of(r): r for r in yesterday}
+    today_levels = {}
+    for row in today:
+        board = board_of(row)
+        if board >= 1:
+            today_levels[board] = today_levels.get(board, 0) + 1
+    yesterday_levels = {}
+    for row in yesterday:
+        board = board_of(row)
+        if board >= 1:
+            yesterday_levels[board] = yesterday_levels.get(board, 0) + 1
+    max_today_board = max(today_levels, default=0)
+    max_prev_board = max(yesterday_levels, default=0)
+    max_level = max(5, max_today_board, max_prev_board)
     promotions = {}
-    for level in (1, 2, 3, 4):
+    # 前一日1板→今日2板，...，直至最高连板；首板不是连板晋级。
+    for level in range(1, max_level + 1):
         cohort = [c for c, r in prev_by_code.items() if board_of(r) == level]
         advanced = [c for c in cohort if c in today_by_code
                     and board_of(today_by_code[c]) == level + 1]
@@ -116,6 +137,14 @@ def fetch_market_snapshot(ymd):
             "rate": round(len(advanced) / len(cohort) * 100, 1) if cohort else None,
             "codes": advanced,
         }
+    # 只表示「昨日4板以上样本今天没有继续晋级」：也可能停牌或数据异常，
+    # 不能未核验即断言「跌停」「核按钮」。
+    high_prior = {c: r for c, r in prev_by_code.items() if board_of(r) >= 4}
+    high_not_advanced = [
+        c for c, row in high_prior.items()
+        if c not in today_by_code
+        or board_of(today_by_code[c]) != board_of(row) + 1
+    ]
     perf_col = "涨跌幅"
     perf_values = [number(r.get(perf_col), 0) for r in yesterday_perf
                    if r.get(perf_col) not in (None, "")]
@@ -140,6 +169,18 @@ def fetch_market_snapshot(ymd):
             "previous_limit_up_avg_change_percent": round(sum(perf_values)/len(perf_values), 2)
             if perf_values else None,
             "promotions": promotions,
+            "first_board_count": today_levels.get(1, 0),
+            "max_board_today": max_today_board,
+            "max_board_previous": max_prev_board,
+            "board_distribution_today": today_levels,
+            "board_distribution_previous": yesterday_levels,
+            "high_board_previous_count": len(high_prior),
+            "high_board_not_advanced_count": len(high_not_advanced),
+            "high_board_not_advanced_codes": high_not_advanced[:25],
+            "top_board_stocks": [
+                {"代码": code_of(r), "名称": r.get("名称"), "连板数": board_of(r)}
+                for r in sorted(today, key=board_of, reverse=True)[:12]
+            ],
             "industry_limit_up_counts": sorted(sectors.items(), key=lambda p: -p[1])[:15],
         },
         "limit_up_stocks": today,
@@ -223,16 +264,120 @@ SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数�
 """
 
 
+
+def local_rule_plan(snapshot, prior, outcomes):
+    """离线可复现的日线情绪规则，不调用LLM；不产生自动隔夜挂单指令。"""
+    stats = snapshot.get("statistics", {})
+    elevated_risk = high_board_risk(stats)
+    limit_up = max(0, int(number(stats.get("limit_up"), 0)))
+    broken_rate = stats.get("broken_rate_percent")
+    premium = stats.get("previous_limit_up_avg_change_percent")
+    promotions = stats.get("promotions", {})
+    one = promotions.get("1进2", {})
+    two = promotions.get("2进3", {})
+
+    def rate_score(cohort, target_rate):
+        if not isinstance(cohort, dict) or number(cohort.get("base")) < 3:
+            return 0.0  # 样本小于3时不靠百分比外推强度
+        value = cohort.get("rate")
+        return min(1.0, max(0.0, number(value) / target_rate)) if value is not None else 0.0
+
+    # 评分只表示当日短线样本情绪，不代表未来收益、成交率或股票质量。
+    breadth_score = 27 * min(1.0, limit_up / 75)
+    failure_score = (23 * (1 - min(1.0, max(0.0, number(broken_rate) / 50)))
+                     if broken_rate is not None else 0)
+    upper = [
+        rate_score(value, 35) for key, value in promotions.items()
+        if isinstance(value, dict) and key.split("进")[0].isdigit()
+        and int(key.split("进")[0]) >= 3 and number(value.get("base")) >= 3
+    ]
+    ladder_score = (14 * rate_score(one, 45) + 10 * rate_score(two, 40)
+                    + 6 * (sum(upper) / len(upper) if upper else 0))
+    premium_score = (20 * min(1.0, max(0.0, (number(premium) + 2) / 6))
+                     if premium is not None else 0)
+    temperature = max(0, min(100, round(
+        breadth_score + failure_score + ladder_score + premium_score
+        - (15 if elevated_risk else 0))))
+
+    one_rate = one.get("rate")
+    two_rate = two.get("rate")
+    if temperature < 45:
+        phase, style, max_position = "退潮或数据偏弱", "空仓观察", 0
+    elif temperature < 60:
+        phase, style, max_position = "修复试错", "优先观察1进2，不追高位缩量加速", 10
+    elif temperature < 75:
+        if two_rate is not None and number(two.get("base")) >= 3 and number(two_rate) >= 35:
+            style = "优先观察2进3的分歧回封，1进2只看最强换手"
+        else:
+            style = "优先观察1进2换手，减少高位接力"
+        phase, max_position = "情绪回暖", 25
+    else:
+        phase, style, max_position = "情绪偏强", "覆盖首板到高标，但高标须分歧转一致后再次确认", 40
+    if elevated_risk:
+        max_position = min(max_position, 10)
+        style += "；昨日高标未晋级偏多，暂停高位接力"
+
+    screening = screen_full_ladder(snapshot, temperature, max_position,
+                                   high_risk=elevated_risk)
+    watchlist = screening["watchlist"]
+
+    avoid = []
+    broken = sorted(snapshot.get("broken_stocks", []),
+                    key=lambda r: number(r.get("炸板次数"), 0), reverse=True)
+    for row in broken:
+        code = code_of(row)
+        if len(code) != 6 or not code.isdigit() or code in [r["code"] for r in avoid]:
+            continue
+        avoid.append({"code": code, "reason": "当天在炸板池中；承接和次日流动性尚未验证，不隔夜排。"})
+        if len(avoid) >= 3:
+            break
+
+    checks = []
+    for code, result in outcomes.items():
+        if result.get("status"):
+            checks.append(f"{code}：{result['status']}")
+        elif result.get("涨跌幅") is not None:
+            checks.append(f"{code}：当日收盘涨跌幅{result['涨跌幅']}%（非交易收益率）")
+    retrospection = (
+        f"前次基线：{prior.get('origin', '未知')}。"
+        + ("；".join(checks[:6]) if checks else "未取得可验证的前次个股收盘数据")
+        + "；不具备逐笔成交和排队记录，不能按实际买入或卖出盈亏验收。"
+    )
+    premium_label = f"{premium}%" if premium is not None else "缺失"
+    summary = (
+        f"【纯本地规则，无大模型】水温{temperature}/100（评分，不是预测概率），"
+        f"涨停{limit_up}、炸板率{broken_rate if broken_rate is not None else '未知'}%、"
+        f"昨日涨停股当日平均涨跌{premium_label}。"
+        f"策略：{style}；参考总仓位上限{max_position}%（非买入指令），"
+        f"单一观察标的参考仓位上限{min(5, max_position)}%，"
+        "遵守单日亏损停止交易及A股T+1约束。"
+        "没有实时竞价、监管公告及隔夜排队条件核验，今晚默认不排。"
+    )
+    predictions = [
+        "次日开盘前复核昨日涨停股平均溢价及竞价高开分布，未验证不提高仓位。",
+        "次日收盘核对首板、1进2、2进3、3进4、4进5以及所有高标的样本晋级情况。",
+        "观察名单仅在次日盘中核对换手、承接和分歧回封，不据此自动发单或撤单。",
+    ]
+    plan = validate_plan({
+        "temperature": temperature, "phase": phase,
+        "summary": summary, "retrospection": retrospection,
+        "overnight": "不排", "overnight_candidates": [],
+        "watchlist": watchlist, "avoid": avoid,
+        "predictions": predictions,
+    }, snapshot)
+    checked = {item["code"] for item in plan["watchlist"]}
+    plan["opportunities"] = [
+        item for item in screening["opportunities"] if item["code"] in checked
+    ]
+    plan["reference_max_position"] = max_position
+    plan["high_board_risk"] = elevated_risk
+    return plan
+
+
 def model_plan(snapshot, prior, outcomes):
     key = os.environ.get("OPENAI_API_KEY", "")
     if not key:
-        return {
-            "temperature": None, "phase": "未启用模型",
-            "summary": "已完成涨停梯队统计；未配置AI接口，不自动生成个股策略。",
-            "retrospection": "可核实的上一计划标的日线见下。缺少竞价和逐笔排队数据，不评估实际成交。",
-            "overnight": "不排", "overnight_candidates": [],
-            "watchlist": [], "avoid": [], "predictions": [],
-        }
+        return local_rule_plan(snapshot, prior, outcomes)
     from openai import OpenAI
     kwargs = {"api_key": key, "timeout": 75}
     if os.getenv("OPENAI_BASE_URL"):
@@ -276,7 +421,8 @@ def validate_plan(plan, snapshot):
                 valid.append({"code": code, "name": allowed[code].get("名称", ""),
                               "board": board_of(allowed[code]),
                               "reason": str(item.get("reason", ""))[:400]})
-        clean[key] = valid[:2 if key == "overnight_candidates" else 4]
+        clean[key] = valid[:2 if key == "overnight_candidates" else
+                           24 if key == "watchlist" else 6]
     decision = "排" if plan.get("overnight") == "排" and clean["overnight_candidates"] else "不排"
     # 模型的“不排”判断必须与实际候选保持一致，避免自相矛盾的报告。
     if decision == "不排":
@@ -307,8 +453,7 @@ def render(snapshot, prior, outcomes, plan):
         f"涨停 {s['limit_up']} 家｜炸板 {s['broken']} 家｜炸板率 {s['broken_rate_percent']}%",
         f"昨日涨停股当日平均涨跌：{s['previous_limit_up_avg_change_percent']}%（接口可用时）",
     ]
-    for name, item in s["promotions"].items():
-        lines.append(f"{name}：{item['count']}/{item['base']}（{item['rate'] if item['rate'] is not None else '无样本'}%）")
+    lines.extend(ladder_report(snapshot, plan))
     lines += ["", "### 昨日策略验收", f"基线：{prior['origin']}",
               plan.get("retrospection") or "无可验证的前日策略记录。"]
     if outcomes:
@@ -419,12 +564,12 @@ def main():
         return 0
     prior = previous_plan(today)
     outcomes = stock_outcomes(snapshot, prior)
-    # 没有模型或模型调用失败时选择不排，不生成伪造个股建议。
+    # 不配置API Key时直接运行确定性行情规则；模型异常时同样回退本地规则。
     try:
         plan = model_plan(snapshot, prior, outcomes)
     except Exception as exc:
-        print(f"模型生成失败，将发送纯统计复盘并提示不排：{type(exc).__name__}", file=sys.stderr)
-        plan = model_plan_without_ai()
+        print(f"模型调用失败，改为本地规则复盘：{type(exc).__name__}", file=sys.stderr)
+        plan = local_rule_plan(snapshot, prior, outcomes)
     content = render(snapshot, prior, outcomes, plan)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUT_DIR / f"{today}.md"

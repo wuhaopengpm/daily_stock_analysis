@@ -83,6 +83,80 @@ class CandidateTests(unittest.TestCase):
         self.assertFalse(result["overnight_candidates"])
 
 
+
+class LocalRuleTests(unittest.TestCase):
+    def _market(self, up=80, broken=15, premium=3.0, one_rate=50, two_rate=45,
+                one_base=20, two_base=8):
+        data = snapshot()
+        data["statistics"] = {
+            "limit_up": up,
+            "broken": broken,
+            "broken_rate_percent": broken / (up + broken) * 100 if up + broken else None,
+            "previous_limit_up_avg_change_percent": premium,
+            "promotions": {
+                "1进2": {"base": one_base, "count": int(one_base * one_rate / 100),
+                        "rate": one_rate},
+                "2进3": {"base": two_base, "count": int(two_base * two_rate / 100),
+                        "rate": two_rate},
+                "3进4": {"base": 1, "count": 0, "rate": 0},
+                "4进5": {"base": 0, "count": 0, "rate": None},
+            },
+        }
+        return data
+
+    def test_without_api_key_gives_real_strategy_rules_not_empty_ai_placeholder(self):
+        market = self._market()
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": ""}):
+            result = mod.model_plan(market, {"origin": "无前日基线"}, {})
+        self.assertIsInstance(result["temperature"], int)
+        self.assertIn("本地规则", result["summary"])
+        self.assertIn("仓位", result["summary"])
+        self.assertEqual(result["overnight"], "不排")
+        self.assertEqual(result["overnight_candidates"], [])
+        self.assertTrue(result["predictions"])
+        self.assertEqual([r["code"] for r in result["watchlist"]], ["603197"])
+
+    def test_weak_market_recommends_no_position_and_never_overnight(self):
+        market = self._market(up=8, broken=25, premium=-3, one_rate=0, two_rate=0)
+        result = mod.local_rule_plan(market, {"origin": "无"}, {})
+        self.assertLess(result["temperature"], 45)
+        self.assertIn("空仓观察", result["summary"])
+        self.assertIn("0%", result["summary"])
+        self.assertEqual(result["overnight"], "不排")
+
+    def test_strong_market_has_capped_position_and_filters_st(self):
+        market = self._market(up=95, broken=5, premium=4, one_rate=65, two_rate=55)
+        market["limit_up_stocks"] += [
+            {"代码": "002999", "名称": "*ST测试", "连板数": 3, "炸板次数": 0},
+            {"代码": "603888", "名称": "正常个股", "连板数": 3, "炸板次数": 0},
+        ]
+        result = mod.local_rule_plan(market, {"origin": "昨日"}, {})
+        self.assertGreaterEqual(result["temperature"], 75)
+        self.assertIn("40%", result["summary"])
+        self.assertEqual(result["overnight"], "不排")
+        codes = [x["code"] for x in result["watchlist"]]
+        self.assertIn("603888", codes)
+        self.assertNotIn("002999", codes)
+
+    def test_tiny_advancement_cohort_never_counts_as_strong_evidence(self):
+        one = self._market(up=45, broken=20, premium=0, one_base=1,
+                           two_base=1, one_rate=100, two_rate=100)
+        two = self._market(up=45, broken=20, premium=0, one_base=1,
+                           two_base=1, one_rate=0, two_rate=0)
+        p1 = mod.local_rule_plan(one, {}, {})
+        p2 = mod.local_rule_plan(two, {}, {})
+        self.assertEqual(p1["temperature"], p2["temperature"])
+
+    def test_previous_day_performance_never_claims_fill(self):
+        data = self._market()
+        result = mod.local_rule_plan(
+            data, {"origin": "昨日日终记录"},
+            {"603197": {"涨跌幅": 8.3}})
+        self.assertIn("8.3%", result["retrospection"])
+        self.assertIn("非交易收益率", result["retrospection"])
+        self.assertIn("不能按实际买入", result["retrospection"])
+
+
 class NotificationTests(unittest.TestCase):
     def test_signature_is_correct_and_encoded_once(self):
         secret = "SEC-TEST+/="
