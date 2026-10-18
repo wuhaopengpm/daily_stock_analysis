@@ -100,14 +100,29 @@ def fetch_market_snapshot(ymd):
         if not {"代码", "名称", "连板数"}.issubset(set(df.columns)):
             raise RuntimeError(f"{name}缺少必要列，停止分析：{list(df.columns)}")
     # 仅对当日涨停股计算晋级；复牌一字板的成交可行性需单独核验。
-    today = rows(zt_today_df)
-    yesterday = rows(zt_yesterday_df)
-    broken = rows(broken_df)
-    yesterday_perf = rows(previous_performance_df)
+    # 不截断涨停/昨日涨停全梯队，避免高板数量与晋级分母发生系统性遗漏。
+    today = rows(zt_today_df, max_rows=len(zt_today_df))
+    yesterday = rows(zt_yesterday_df, max_rows=len(zt_yesterday_df))
+    broken = rows(broken_df, max_rows=len(broken_df))
+    yesterday_perf = rows(previous_performance_df, max_rows=len(previous_performance_df))
     today_by_code = {code_of(r): r for r in today}
     prev_by_code = {code_of(r): r for r in yesterday}
+    today_levels = {}
+    for row in today:
+        board = board_of(row)
+        if board >= 1:
+            today_levels[board] = today_levels.get(board, 0) + 1
+    yesterday_levels = {}
+    for row in yesterday:
+        board = board_of(row)
+        if board >= 1:
+            yesterday_levels[board] = yesterday_levels.get(board, 0) + 1
+    max_today_board = max(today_levels, default=0)
+    max_prev_board = max(yesterday_levels, default=0)
+    max_level = max(5, max_today_board, max_prev_board)
     promotions = {}
-    for level in (1, 2, 3, 4):
+    # 前一日1板→今日2板，...，直至最高连板；首板不是连板晋级。
+    for level in range(1, max_level + 1):
         cohort = [c for c, r in prev_by_code.items() if board_of(r) == level]
         advanced = [c for c in cohort if c in today_by_code
                     and board_of(today_by_code[c]) == level + 1]
@@ -116,6 +131,14 @@ def fetch_market_snapshot(ymd):
             "rate": round(len(advanced) / len(cohort) * 100, 1) if cohort else None,
             "codes": advanced,
         }
+    # 只表示「昨日4板以上样本今天没有继续晋级」：也可能停牌或数据异常，
+    # 不能未核验即断言「跌停」「核按钮」。
+    high_prior = {c: r for c, r in prev_by_code.items() if board_of(r) >= 4}
+    high_not_advanced = [
+        c for c, row in high_prior.items()
+        if c not in today_by_code
+        or board_of(today_by_code[c]) != board_of(row) + 1
+    ]
     perf_col = "涨跌幅"
     perf_values = [number(r.get(perf_col), 0) for r in yesterday_perf
                    if r.get(perf_col) not in (None, "")]
@@ -140,6 +163,18 @@ def fetch_market_snapshot(ymd):
             "previous_limit_up_avg_change_percent": round(sum(perf_values)/len(perf_values), 2)
             if perf_values else None,
             "promotions": promotions,
+            "first_board_count": today_levels.get(1, 0),
+            "max_board_today": max_today_board,
+            "max_board_previous": max_prev_board,
+            "board_distribution_today": today_levels,
+            "board_distribution_previous": yesterday_levels,
+            "high_board_previous_count": len(high_prior),
+            "high_board_not_advanced_count": len(high_not_advanced),
+            "high_board_not_advanced_codes": high_not_advanced[:25],
+            "top_board_stocks": [
+                {"代码": code_of(r), "名称": r.get("名称"), "连板数": board_of(r)}
+                for r in sorted(today, key=board_of, reverse=True)[:12]
+            ],
             "industry_limit_up_counts": sorted(sectors.items(), key=lambda p: -p[1])[:15],
         },
         "limit_up_stocks": today,
