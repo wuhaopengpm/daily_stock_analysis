@@ -223,16 +223,129 @@ SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数�
 """
 
 
+
+def local_rule_plan(snapshot, prior, outcomes):
+    """离线可复现的日线情绪规则，不调用LLM；不产生自动隔夜挂单指令。"""
+    stats = snapshot["statistics"]
+    limit_up = max(0, int(number(stats.get("limit_up"), 0)))
+    broken_rate = stats.get("broken_rate_percent")
+    premium = stats.get("previous_limit_up_avg_change_percent")
+    promotions = stats.get("promotions", {})
+    one = promotions.get("1进2", {})
+    two = promotions.get("2进3", {})
+
+    def rate_score(cohort, target_rate):
+        if not isinstance(cohort, dict) or number(cohort.get("base")) < 3:
+            return 0.0  # 样本小于3时不靠百分比外推强度
+        value = cohort.get("rate")
+        return min(1.0, max(0.0, number(value) / target_rate)) if value is not None else 0.0
+
+    # 评分只表示当日短线样本情绪，不代表未来收益、成交率或股票质量。
+    breadth_score = 30 * min(1.0, limit_up / 75)
+    failure_score = (25 * (1 - min(1.0, max(0.0, number(broken_rate) / 50)))
+                     if broken_rate is not None else 0)
+    ladder_score = 15 * rate_score(one, 45) + 10 * rate_score(two, 40)
+    premium_score = (20 * min(1.0, max(0.0, (number(premium) + 2) / 6))
+                     if premium is not None else 0)
+    temperature = max(0, min(100, round(
+        breadth_score + failure_score + ladder_score + premium_score)))
+
+    one_rate = one.get("rate")
+    two_rate = two.get("rate")
+    if temperature < 45:
+        phase, style, max_position = "退潮或数据偏弱", "空仓观察", 0
+    elif temperature < 60:
+        phase, style, max_position = "修复试错", "优先观察1进2，不追高位缩量加速", 10
+    elif temperature < 75:
+        if two_rate is not None and number(two.get("base")) >= 3 and number(two_rate) >= 35:
+            style = "优先观察2进3的分歧回封，1进2只看最强换手"
+        else:
+            style = "优先观察1进2换手，减少高位接力"
+        phase, max_position = "情绪回暖", 25
+    else:
+        phase, style, max_position = "情绪偏强", "优先观察换手龙头和2进3，拒绝无换手一字接力", 40
+
+    def eligible(row):
+        code = code_of(row)
+        name = str(row.get("名称") or "")
+        return (len(code) == 6 and code.isdigit() and "ST" not in name.upper()
+                and "退" not in name and board_of(row) >= 1)
+
+    def rank(row):
+        # 连板数、炸板次数、换手率、封板资金均来自收盘行情；非竞价数据。
+        board = board_of(row)
+        pops = max(0, number(row.get("炸板次数"), 0))
+        turnover = number(row.get("换手率"), 0)
+        # 有一定换手的中位连板股仅用于观察，不推断排队可成交率。
+        return (int(2 <= board <= 4), -abs(board - 2), -pops,
+                int(2 <= turnover <= 22), number(row.get("封板资金"), 0))
+
+    ranked = sorted(
+        [row for row in snapshot.get("limit_up_stocks", []) if eligible(row)],
+        key=rank, reverse=True)
+    watchlist = []
+    for row in ranked:
+        if len(watchlist) >= (4 if max_position >= 25 else 2):
+            break
+        code = code_of(row)
+        board = board_of(row)
+        pops = row.get("炸板次数")
+        turnover = row.get("换手率")
+        note = (f"收盘{board}板；炸板次数{pops if pops is not None else '未知'}；"
+                f"换手率{turnover if turnover is not None else '未知'}%。"
+                "仅列为下个交易日竞价观察，须现场确认换手承接、回封及公告，"
+                "不根据收盘数据预判可排到涨停。")
+        watchlist.append({"code": code, "reason": note})
+
+    avoid = []
+    broken = sorted(snapshot.get("broken_stocks", []),
+                    key=lambda r: number(r.get("炸板次数"), 0), reverse=True)
+    for row in broken:
+        code = code_of(row)
+        if len(code) != 6 or not code.isdigit() or code in [r["code"] for r in avoid]:
+            continue
+        avoid.append({"code": code, "reason": "当天在炸板池中；承接和次日流动性尚未验证，不隔夜排。"})
+        if len(avoid) >= 3:
+            break
+
+    checks = []
+    for code, result in outcomes.items():
+        if result.get("status"):
+            checks.append(f"{code}：{result['status']}")
+        elif result.get("涨跌幅") is not None:
+            checks.append(f"{code}：当日收盘涨跌幅{result['涨跌幅']}%（非交易收益率）")
+    retrospection = (
+        f"前次基线：{prior.get('origin', '未知')}。"
+        + ("；".join(checks[:6]) if checks else "未取得可验证的前次个股收盘数据")
+        + "；不具备逐笔成交和排队记录，不能按实际买入或卖出盈亏验收。"
+    )
+    premium_label = f"{premium}%" if premium is not None else "缺失"
+    summary = (
+        f"【纯本地规则，无大模型】水温{temperature}/100（评分，不是预测概率），"
+        f"涨停{limit_up}、炸板率{broken_rate if broken_rate is not None else '未知'}%、"
+        f"昨日涨停股当日平均涨跌{premium_label}。"
+        f"策略：{style}；参考总仓位上限{max_position}%（非买入指令），"
+        "单一观察标的试错仓上限5%，遵守单日亏损停止交易及A股T+1约束。"
+        "没有实时竞价、监管公告及隔夜排队条件核验，今晚默认不排。"
+    )
+    predictions = [
+        "次日开盘前复核昨日涨停股平均溢价及竞价高开分布，未验证不提高仓位。",
+        "次日收盘核对1进2、2进3样本分母与晋级数量，评价今日情绪规则是否失效。",
+        "观察名单仅在次日盘中核对换手、承接和分歧回封，不据此自动发单或撤单。",
+    ]
+    return validate_plan({
+        "temperature": temperature, "phase": phase,
+        "summary": summary, "retrospection": retrospection,
+        "overnight": "不排", "overnight_candidates": [],
+        "watchlist": watchlist, "avoid": avoid,
+        "predictions": predictions,
+    }, snapshot)
+
+
 def model_plan(snapshot, prior, outcomes):
     key = os.environ.get("OPENAI_API_KEY", "")
     if not key:
-        return {
-            "temperature": None, "phase": "未启用模型",
-            "summary": "已完成涨停梯队统计；未配置AI接口，不自动生成个股策略。",
-            "retrospection": "可核实的上一计划标的日线见下。缺少竞价和逐笔排队数据，不评估实际成交。",
-            "overnight": "不排", "overnight_candidates": [],
-            "watchlist": [], "avoid": [], "predictions": [],
-        }
+        return local_rule_plan(snapshot, prior, outcomes)
     from openai import OpenAI
     kwargs = {"api_key": key, "timeout": 75}
     if os.getenv("OPENAI_BASE_URL"):
@@ -419,12 +532,12 @@ def main():
         return 0
     prior = previous_plan(today)
     outcomes = stock_outcomes(snapshot, prior)
-    # 没有模型或模型调用失败时选择不排，不生成伪造个股建议。
+    # 不配置API Key时直接运行确定性行情规则；模型异常时同样回退本地规则。
     try:
         plan = model_plan(snapshot, prior, outcomes)
     except Exception as exc:
-        print(f"模型生成失败，将发送纯统计复盘并提示不排：{type(exc).__name__}", file=sys.stderr)
-        plan = model_plan_without_ai()
+        print(f"模型调用失败，改为本地规则复盘：{type(exc).__name__}", file=sys.stderr)
+        plan = local_rule_plan(snapshot, prior, outcomes)
     content = render(snapshot, prior, outcomes, plan)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUT_DIR / f"{today}.md"
