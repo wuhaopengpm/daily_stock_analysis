@@ -215,6 +215,41 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["msgtype"], "markdown")
 
 
+
+class HistoricalManualRunTests(unittest.TestCase):
+    def test_manual_sunday_uses_prior_trading_day(self):
+        import pandas as pd
+        from datetime import datetime
+        stub = types.SimpleNamespace(
+            tool_trade_date_hist_sina=lambda: pd.DataFrame({
+                "trade_date": ["2026-10-16", "2026-10-19"]}))
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=mod.TZ)
+        with mock.patch.dict("os.environ", {"GITHUB_EVENT_NAME": "workflow_dispatch"}), \
+             mock.patch.dict(sys.modules, {"akshare": stub}), \
+             mock.patch.object(mod, "local_now", return_value=now), \
+             mock.patch.object(mod, "fetch_market_snapshot", return_value=None) as fetch, \
+             mock.patch.object(sys, "argv", ["main.py", "--mode", "review"]):
+            self.assertEqual(mod.main(), 0)
+        fetch.assert_called_once_with("20261016")
+
+    def test_schedule_does_not_backfill_weekends(self):
+        from datetime import datetime
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=mod.TZ)
+        with mock.patch.dict("os.environ", {"GITHUB_EVENT_NAME": "schedule"}), \
+             mock.patch.object(mod, "local_now", return_value=now), \
+             mock.patch.object(mod, "fetch_market_snapshot", return_value=None) as fetch, \
+             mock.patch.object(sys, "argv", ["main.py", "--mode", "review"]):
+            self.assertEqual(mod.main(), 0)
+        fetch.assert_called_once_with("20261018")
+
+    def test_future_historical_date_rejected(self):
+        from datetime import datetime
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=mod.TZ)
+        with mock.patch.object(mod, "local_now", return_value=now), \
+             mock.patch.object(sys, "argv", ["main.py", "--mode", "review", "--as-of", "20261019"]):
+            with self.assertRaises(SystemExit):
+                mod.main()
+
 class SnapshotTests(unittest.TestCase):
     def test_trade_day_counts_and_promotion(self):
         import pandas as pd
