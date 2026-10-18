@@ -215,6 +215,97 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["msgtype"], "markdown")
 
 
+
+class HistoricalManualRunTests(unittest.TestCase):
+    def test_manual_sunday_uses_prior_trading_day(self):
+        import pandas as pd
+        from datetime import datetime
+        stub = types.SimpleNamespace(
+            tool_trade_date_hist_sina=lambda: pd.DataFrame({
+                "trade_date": ["2026-10-16", "2026-10-19"]}))
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=mod.TZ)
+        with mock.patch.dict("os.environ", {"GITHUB_EVENT_NAME": "workflow_dispatch"}), \
+             mock.patch.dict(sys.modules, {"akshare": stub}), \
+             mock.patch.object(mod, "local_now", return_value=now), \
+             mock.patch.object(mod, "fetch_market_snapshot", return_value=None) as fetch, \
+             mock.patch.object(sys, "argv", ["main.py", "--mode", "review"]):
+            self.assertEqual(mod.main(), 0)
+        fetch.assert_called_once_with("20261016")
+
+    def test_schedule_does_not_backfill_weekends(self):
+        from datetime import datetime
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=mod.TZ)
+        with mock.patch.dict("os.environ", {"GITHUB_EVENT_NAME": "schedule"}), \
+             mock.patch.object(mod, "local_now", return_value=now), \
+             mock.patch.object(mod, "fetch_market_snapshot", return_value=None) as fetch, \
+             mock.patch.object(sys, "argv", ["main.py", "--mode", "review"]):
+            self.assertEqual(mod.main(), 0)
+        fetch.assert_called_once_with("20261018")
+
+    def test_manual_sunday_creates_historical_report_and_sends(self):
+        import pandas as pd
+        from datetime import datetime
+        today = datetime(2026, 10, 18, 18, 0, tzinfo=mod.TZ)
+        stub = types.SimpleNamespace(
+            tool_trade_date_hist_sina=lambda: pd.DataFrame({
+                "trade_date": ["2026-10-16", "2026-10-19"]}))
+        snap = {
+            "date": "20261016", "previous_trade_day": "20261015",
+            "statistics": {
+                "limit_up": 1, "broken": 0,
+                "broken_rate_percent": 0,
+                "previous_limit_up_avg_change_percent": 2.0,
+                "promotions": {}, "first_board_count": 1,
+                "max_board_today": 1, "max_board_previous": 2,
+                "board_distribution_today": {1: 1},
+                "board_distribution_previous": {2: 1},
+                "high_board_previous_count": 0,
+                "high_board_not_advanced_count": 0,
+                "top_board_stocks": [],
+            },
+            "limit_up_stocks": [stock("600001", "样例股票", 1)],
+            "yesterday_limit_up_stocks": [],
+            "broken_stocks": [],
+        }
+        plan = {
+            "temperature": 30, "phase": "退潮",
+            "overnight": "不排", "overnight_candidates": [],
+            "watchlist": [], "avoid": [],
+            "summary": "仅分析历史交易日，不作当日信号",
+            "retrospection": "无前日基线", "predictions": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            with mock.patch.dict("os.environ", {"GITHUB_EVENT_NAME": "workflow_dispatch"}), \
+                 mock.patch.dict(sys.modules, {"akshare": stub}), \
+                 mock.patch.object(mod, "local_now", return_value=today), \
+                 mock.patch.object(mod, "OUT_DIR", out / "reports"), \
+                 mock.patch.object(mod, "STATE_FILE", out / "state.json"), \
+                 mock.patch.object(mod, "fetch_market_snapshot", return_value=snap) as fetch, \
+                 mock.patch.object(mod, "previous_plan", return_value={"origin": "无记录"}), \
+                 mock.patch.object(mod, "stock_outcomes", return_value={}), \
+                 mock.patch.object(mod, "model_plan", return_value=plan), \
+                 mock.patch.object(mod, "send_dingtalk") as send, \
+                 mock.patch.object(sys, "argv", ["main.py", "--mode", "review"]):
+                self.assertEqual(mod.main(), 0)
+            fetch.assert_called_once_with("20261016")
+            send.assert_called_once()
+            message = send.call_args.args[0]
+            self.assertIn("历史交易日复盘补跑", message)
+            self.assertIn("行情日期：20261016", message)
+            self.assertIn("不代表今天市场的实时信号", message)
+            self.assertIn("连板全梯队", message)
+            self.assertTrue((out / "reports" / "20261016.md").exists())
+            self.assertEqual(json.loads((out / "state.json").read_text())["date"], "20261016")
+
+    def test_future_historical_date_rejected(self):
+        from datetime import datetime
+        now = datetime(2026, 10, 18, 18, 0, tzinfo=mod.TZ)
+        with mock.patch.object(mod, "local_now", return_value=now), \
+             mock.patch.object(sys, "argv", ["main.py", "--mode", "review", "--as-of", "20261019"]):
+            with self.assertRaises(SystemExit):
+                mod.main()
+
 class SnapshotTests(unittest.TestCase):
     def test_trade_day_counts_and_promotion(self):
         import pandas as pd

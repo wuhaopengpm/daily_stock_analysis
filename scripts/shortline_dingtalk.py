@@ -552,12 +552,39 @@ def send_dingtalk(text):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("test", "review"), default="test")
+    parser.add_argument("--as-of", default="", help="手动补跑交易日 YYYYMMDD；定时任务默认当日")
     args = parser.parse_args()
     if args.mode == "test":
         send_dingtalk(f"【股票】GitHub Actions→钉钉通道测试成功；北京时间：{local_now():%Y-%m-%d %H:%M}。未调用行情和AI接口。")
         print("DingTalk test message delivered")
         return 0
     today = local_now().strftime("%Y%m%d")
+    historical = bool(args.as_of)
+    if historical:
+        try:
+            target = datetime.strptime(args.as_of, "%Y%m%d").date()
+        except ValueError:
+            raise SystemExit("手动补跑日期必须为真实有效的 YYYYMMDD，例如 20261016")
+        delta = local_now().date() - target
+        if delta.days < 0 or delta.days > 30:
+            raise SystemExit("手动补跑仅允许最近30日内且不晚于今天的日期")
+        today = target.strftime("%Y%m%d")
+    elif os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        # GitHub 手动 review 适用于非交易日的联调；默认工作日定时任务不补跑。
+        import akshare as ak
+        import pandas as pd
+        calendar = ak.tool_trade_date_hist_sina()
+        if calendar is None or calendar.empty or "trade_date" not in calendar:
+            raise RuntimeError("手动补跑无法验证交易日历，不生成历史报告")
+        dates = pd.to_datetime(calendar["trade_date"]).dt.strftime("%Y%m%d")
+        prior_days = [d for d in dates if d <= today]
+        if not prior_days:
+            raise RuntimeError("交易日历没有可用的历史交易日")
+        manual_day = max(prior_days)
+        if manual_day != today:
+            today, historical = manual_day, True
+            if (local_now().date() - datetime.strptime(today, "%Y%m%d").date()).days > 7:
+                raise RuntimeError("最近交易日超过7天，不自动历史补跑")
     snapshot = fetch_market_snapshot(today)
     if snapshot is None:
         print(f"{today}不是A股交易日，不发送复盘。")
@@ -571,6 +598,14 @@ def main():
         print(f"模型调用失败，改为本地规则复盘：{type(exc).__name__}", file=sys.stderr)
         plan = local_rule_plan(snapshot, prior, outcomes)
     content = render(snapshot, prior, outcomes, plan)
+    if historical and today != local_now().strftime("%Y%m%d"):
+        stamp = local_now().strftime("%Y-%m-%d %H:%M")
+        content = (
+            f"## 【股票】历史交易日复盘补跑｜行情日期：{today}｜实际发送：{stamp}（北京时间）\n\n"
+            "**这是一份历史收盘研究记录，不代表今天市场的实时信号；"
+            "任何候选、仓位或排板条件均须用下一个实际交易日行情重新验证。**\n\n"
+            + content
+        )
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUT_DIR / f"{today}.md"
     path.write_text(content, encoding="utf-8")
