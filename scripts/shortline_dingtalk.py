@@ -261,7 +261,9 @@ SYSTEM_PROMPT = """你是A股短线研究员。只依据JSON里的已核实数�
 
 def local_rule_plan(snapshot, prior, outcomes):
     """离线可复现的日线情绪规则，不调用LLM；不产生自动隔夜挂单指令。"""
+    from scripts.shortline_ladder import high_board_risk, screen_full_ladder
     stats = snapshot.get("statistics", {})
+    elevated_risk = high_board_risk(stats)
     limit_up = max(0, int(number(stats.get("limit_up"), 0)))
     broken_rate = stats.get("broken_rate_percent")
     premium = stats.get("previous_limit_up_avg_change_percent")
@@ -276,14 +278,21 @@ def local_rule_plan(snapshot, prior, outcomes):
         return min(1.0, max(0.0, number(value) / target_rate)) if value is not None else 0.0
 
     # 评分只表示当日短线样本情绪，不代表未来收益、成交率或股票质量。
-    breadth_score = 30 * min(1.0, limit_up / 75)
-    failure_score = (25 * (1 - min(1.0, max(0.0, number(broken_rate) / 50)))
+    breadth_score = 27 * min(1.0, limit_up / 75)
+    failure_score = (23 * (1 - min(1.0, max(0.0, number(broken_rate) / 50)))
                      if broken_rate is not None else 0)
-    ladder_score = 15 * rate_score(one, 45) + 10 * rate_score(two, 40)
+    upper = [
+        rate_score(value, 35) for key, value in promotions.items()
+        if isinstance(value, dict) and key.split("进")[0].isdigit()
+        and int(key.split("进")[0]) >= 3 and number(value.get("base")) >= 3
+    ]
+    ladder_score = (14 * rate_score(one, 45) + 10 * rate_score(two, 40)
+                    + 6 * (sum(upper) / len(upper) if upper else 0))
     premium_score = (20 * min(1.0, max(0.0, (number(premium) + 2) / 6))
                      if premium is not None else 0)
     temperature = max(0, min(100, round(
-        breadth_score + failure_score + ladder_score + premium_score)))
+        breadth_score + failure_score + ladder_score + premium_score
+        - (15 if elevated_risk else 0))))
 
     one_rate = one.get("rate")
     two_rate = two.get("rate")
@@ -298,39 +307,14 @@ def local_rule_plan(snapshot, prior, outcomes):
             style = "优先观察1进2换手，减少高位接力"
         phase, max_position = "情绪回暖", 25
     else:
-        phase, style, max_position = "情绪偏强", "优先观察换手龙头和2进3，拒绝无换手一字接力", 40
+        phase, style, max_position = "情绪偏强", "覆盖首板到高标，但高标须分歧转一致后再次确认", 40
+    if elevated_risk:
+        max_position = min(max_position, 10)
+        style += "；昨日高标未晋级偏多，暂停高位接力"
 
-    def eligible(row):
-        code = code_of(row)
-        name = str(row.get("名称") or "")
-        return (len(code) == 6 and code.isdigit() and "ST" not in name.upper()
-                and "退" not in name and board_of(row) >= 1)
-
-    def rank(row):
-        # 连板数、炸板次数、换手率、封板资金均来自收盘行情；非竞价数据。
-        board = board_of(row)
-        pops = max(0, number(row.get("炸板次数"), 0))
-        turnover = number(row.get("换手率"), 0)
-        # 有一定换手的中位连板股仅用于观察，不推断排队可成交率。
-        return (int(2 <= board <= 4), -abs(board - 2), -pops,
-                int(2 <= turnover <= 22), number(row.get("封板资金"), 0))
-
-    ranked = sorted(
-        [row for row in snapshot.get("limit_up_stocks", []) if eligible(row)],
-        key=rank, reverse=True)
-    watchlist = []
-    for row in ranked:
-        if len(watchlist) >= (4 if max_position >= 25 else 2):
-            break
-        code = code_of(row)
-        board = board_of(row)
-        pops = row.get("炸板次数")
-        turnover = row.get("换手率")
-        note = (f"收盘{board}板；炸板次数{pops if pops is not None else '未知'}；"
-                f"换手率{turnover if turnover is not None else '未知'}%。"
-                "仅列为下个交易日竞价观察，须现场确认换手承接、回封及公告，"
-                "不根据收盘数据预判可排到涨停。")
-        watchlist.append({"code": code, "reason": note})
+    screening = screen_full_ladder(snapshot, temperature, max_position,
+                                   high_risk=elevated_risk)
+    watchlist = screening["watchlist"]
 
     avoid = []
     broken = sorted(snapshot.get("broken_stocks", []),
@@ -366,16 +350,23 @@ def local_rule_plan(snapshot, prior, outcomes):
     )
     predictions = [
         "次日开盘前复核昨日涨停股平均溢价及竞价高开分布，未验证不提高仓位。",
-        "次日收盘核对1进2、2进3样本分母与晋级数量，评价今日情绪规则是否失效。",
+        "次日收盘核对首板、1进2、2进3、3进4、4进5以及所有高标的样本晋级情况。",
         "观察名单仅在次日盘中核对换手、承接和分歧回封，不据此自动发单或撤单。",
     ]
-    return validate_plan({
+    plan = validate_plan({
         "temperature": temperature, "phase": phase,
         "summary": summary, "retrospection": retrospection,
         "overnight": "不排", "overnight_candidates": [],
         "watchlist": watchlist, "avoid": avoid,
         "predictions": predictions,
     }, snapshot)
+    checked = {item["code"] for item in plan["watchlist"]}
+    plan["opportunities"] = [
+        item for item in screening["opportunities"] if item["code"] in checked
+    ]
+    plan["reference_max_position"] = max_position
+    plan["high_board_risk"] = elevated_risk
+    return plan
 
 
 def model_plan(snapshot, prior, outcomes):
@@ -425,7 +416,8 @@ def validate_plan(plan, snapshot):
                 valid.append({"code": code, "name": allowed[code].get("名称", ""),
                               "board": board_of(allowed[code]),
                               "reason": str(item.get("reason", ""))[:400]})
-        clean[key] = valid[:2 if key == "overnight_candidates" else 4]
+        clean[key] = valid[:2 if key == "overnight_candidates" else
+                           24 if key == "watchlist" else 6]
     decision = "排" if plan.get("overnight") == "排" and clean["overnight_candidates"] else "不排"
     # 模型的“不排”判断必须与实际候选保持一致，避免自相矛盾的报告。
     if decision == "不排":
